@@ -1,0 +1,10 @@
+cradle:
+  cabal:
+    - path: "src"
+      component: "lib:seb"
+
+    - path: "app/Main.hs"
+      component: "seb:exe:seb-exe"
+
+    - path: "test"
+      component: "seb:test:seb-test"
