@@ -1,0 +1,10 @@
+cradle:
+  stack:
+    - path: "./src"
+      component: "seb:lib"
+
+    - path: "./app/Main.hs"
+      component: "seb:exe:seb-exe"
+
+    - path: "./test"
+      component: "seb:test:seb-test"
