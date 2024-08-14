@@ -1,22 +1,23 @@
 use http_body_util::{BodyExt, combinators::BoxBody, StreamBody};
-use hyper::{body::{Bytes, Frame}, Request, Response, StatusCode};
+use hyper::{body::{Bytes, Frame, Incoming}, Request, Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use std::sync::{Arc, Mutex};
 use std::future::Future;
 use std::pin::Pin;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::broadcast;
-use tokio_stream::{StreamExt, wrappers::BroadcastStream};
+use tokio_stream::{StreamExt, wrappers::{BroadcastStream, errors::BroadcastStreamRecvError}};
 
 pub enum Error {
-    Io(std::io::Error),
-    Hyper(hyper::Error),
+    HyperHttp(hyper::http::Error),
+    TooFarBehind(u64),
 }
 
 impl std::fmt::Debug for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
-            Error::Io(e) => write!(f, "IO error: {:?}", e),
-            Error::Hyper(e) => write!(f, "Hyper error: {:?}", e),
+            Error::HyperHttp(e) => write!(f, "Hyper HTTP error: {:?}", e),
+            Error::TooFarBehind(n) => write!(f, "Too far behind: {}", n),
         }
     }
 }
@@ -24,92 +25,57 @@ impl std::fmt::Debug for Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
-            Error::Io(e) => write!(f, "IO error: {}", e),
-            Error::Hyper(e) => write!(f, "Hyper error: {}", e),
+            Error::HyperHttp(e) => write!(f, "Hyper HTTP error: {}", e),
+            Error::TooFarBehind(n) => write!(f, "Too far behind: {}", n),
         }
     }
 }
 
 impl std::error::Error for Error {}
 
-impl From<std::io::Error> for Error {
-    fn from(e: std::io::Error) -> Self {
-        Error::Io(e)
-    }
-}
-
-impl From<hyper::Error> for Error {
-    fn from(e: hyper::Error) -> Self {
-        Error::Hyper(e)
-    }
-}
-
-type ServiceResponse = Response<BoxBody<Bytes, hyper::Error>>;
+type ServiceResponse = Response<BoxBody<Bytes, Error>>;
 type ServiceResult = Result<ServiceResponse, Error>;
-type ServiceResultFuture = Pin<Box<dyn Future<Output = ServiceResult> + Send>>;
+type ServiceResultFuture<'a> = Pin<Box<dyn Future<Output = ServiceResult> + Send + 'a>>;
 
 pub struct ServiceHandler {
+    events: Arc<Mutex<Vec<Bytes>>>,
     tx: broadcast::Sender<Bytes>,
 }
 
 impl Clone for ServiceHandler {
     fn clone(&self) -> Self {
         ServiceHandler {
+            events: self.events.clone(),
             tx: self.tx.clone(),
-        }
-    }
-}
-
-impl hyper::service::Service<Request<hyper::body::Incoming>> for ServiceHandler {
-    type Error = Error;
-    type Future = ServiceResultFuture;
-    type Response = ServiceResponse;
-
-    fn call(&self, req: Request<hyper::body::Incoming>) -> Self::Future {
-        match req.method() {
-            &hyper::Method::POST => {
-                self.handle_post(req)
-            },
-            &hyper::Method::GET => {
-                self.handle_get()
-            },
-            _ => {
-                let stream = futures::stream::once(async {
-                    Ok(Frame::data(Bytes::from_static(b"Method not allowed")))
-                });
-                let body = StreamBody::new(stream);
-                Box::pin(async {
-                    Ok(Response::builder()
-                        .status(StatusCode::METHOD_NOT_ALLOWED)
-                        .body(BoxBody::new(body))
-                        .expect("Failed to construct Response"))
-                })
-            }
         }
     }
 }
 
 impl ServiceHandler {
     fn handle_get(&self) -> ServiceResultFuture {
-        let tx = self.tx.clone();
+        let events: Vec<Bytes> = self.events.lock().unwrap().clone();
+        let tx: broadcast::Sender<Bytes> = self.tx.clone();
         Box::pin(async move {
-            let body_stream = BroadcastStream::new(tx.subscribe())
-                .map(|x| {
-                    eprintln!("Forwarding message");
-                    Ok(Frame::data(x.unwrap()))
+            let replay_stream = tokio_stream::iter(events)
+                .map(|x| Ok(Frame::data(x)));
+            let tx_stream = BroadcastStream::new(tx.subscribe())
+                .map(|x| match x {
+                    Ok(data) => Ok(Frame::data(data)),
+                    Err(BroadcastStreamRecvError::Lagged(n)) => Err(Error::TooFarBehind(n)),
                 });
-
-            let stream_body = StreamBody::new(body_stream);
-            let boxed_body = BoxBody::new(stream_body);
-
-            Ok(Response::builder()
+            let stream = replay_stream.chain(tx_stream);
+            let body = BoxBody::new(StreamBody::new(stream));
+            let result = Response::builder()
                 .status(StatusCode::OK)
-                .body(boxed_body)
-                .expect("Failed to construct Response"))
+                .body(body);
+            match result {
+                Ok(response) => Ok(response),
+                Err(e) => Err(Error::HyperHttp(e)),
+            }
         })
     }
 
-    fn handle_post(&self, req: Request<hyper::body::Incoming>) -> ServiceResultFuture {
+    fn handle_post(&self, req: Request<Incoming>) -> ServiceResultFuture {
         let tx = self.tx.clone();
         Box::pin(async move {
             let mut incoming = req.into_body();
@@ -119,10 +85,14 @@ impl ServiceHandler {
                 match frame {
                     Some(Ok(chunk)) => {
                         if let Some(data) = chunk.data_ref() {
+                            // Broadcast the message
                             if tx.send(data.clone()).is_err() {
                                 eprintln!("Failed to broadcast message");
                                 break;
                             }
+
+                            // Store the message
+                            self.events.lock().unwrap().push(data.clone());
                         }
                     },
                     Some(Err(e)) => {
@@ -144,6 +114,45 @@ impl ServiceHandler {
                 .status(StatusCode::OK)
                 .body(BoxBody::new(stream_body))
                 .expect("Failed to construct Response"))
+        })
+    }
+}
+
+
+pub struct ServiceHandlerWrapper {
+    inner: ServiceHandler,
+}
+
+impl Clone for ServiceHandlerWrapper {
+    fn clone(&self) -> Self {
+        ServiceHandlerWrapper {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl hyper::service::Service<Request<Incoming>> for ServiceHandlerWrapper {
+    type Error = Error;
+    type Future = ServiceResultFuture<'static>;
+    type Response = ServiceResponse;
+
+    fn call(&self, req: Request<hyper::body::Incoming>) -> Self::Future {
+        let handler = self.inner.clone();
+        Box::pin(async move {
+            match req.method() {
+                &hyper::Method::GET => handler.handle_get().await,
+                &hyper::Method::POST => handler.handle_post(req).await,
+                _ => {
+                    let stream = futures::stream::once(async {
+                        Ok(Frame::data(Bytes::from_static(b"Method not allowed")))
+                    });
+                    let body = BoxBody::new(StreamBody::new(stream));
+                    Ok(Response::builder()
+                        .status(StatusCode::METHOD_NOT_ALLOWED)
+                        .body(body)
+                        .expect("Failed to construct Response"))
+                }
+            }
         })
     }
 }
@@ -173,8 +182,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let executor = TokioExecutor::default();
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     let http = hyper_util::server::conn::auto::Builder::new(executor);
+    let events = Arc::new(Mutex::new(Vec::new()));
     let (tx, _rx) = broadcast::channel(10);
-    let service = ServiceHandler { tx };
+    let service = ServiceHandlerWrapper {
+        inner: ServiceHandler { events, tx }
+    };
 
     let graceful = hyper_util::server::graceful::GracefulShutdown::new();
     let mut signal = std::pin::pin!(shutdown_signal());
