@@ -52,7 +52,7 @@ impl Clone for ServiceHandler {
 }
 
 impl ServiceHandler {
-    fn handle_get(&self) -> ServiceResultFuture {
+    fn handle_get(&self, _req: Request<Incoming>) -> ServiceResultFuture {
         let events: Vec<Bytes> = self.events.lock().unwrap().clone();
         let tx: broadcast::Sender<Bytes> = self.tx.clone();
         Box::pin(async move {
@@ -61,9 +61,10 @@ impl ServiceHandler {
             let tx_stream = BroadcastStream::new(tx.subscribe())
                 .map(|x| match x {
                     Ok(data) => Ok(Frame::data(data)),
-                    Err(BroadcastStreamRecvError::Lagged(n)) => Err(Error::TooFarBehind(n)),
+                    Err(BroadcastStreamRecvError::Lagged(n)) =>
+                        Err(Error::TooFarBehind(n)),
                 });
-            let stream = replay_stream.chain(tx_stream);
+            let stream = replay_stream.chain(tx_stream).take(10);
             let body = BoxBody::new(StreamBody::new(stream));
             let result = Response::builder()
                 .status(StatusCode::OK)
@@ -85,14 +86,14 @@ impl ServiceHandler {
                 match frame {
                     Some(Ok(chunk)) => {
                         if let Some(data) = chunk.data_ref() {
+                            // Store the message
+                            self.events.lock().unwrap().push(data.clone());
+
                             // Broadcast the message
                             if tx.send(data.clone()).is_err() {
                                 eprintln!("Failed to broadcast message");
                                 break;
                             }
-
-                            // Store the message
-                            self.events.lock().unwrap().push(data.clone());
                         }
                     },
                     Some(Err(e)) => {
@@ -110,10 +111,14 @@ impl ServiceHandler {
                 Ok(Frame::data(Bytes::from_static(b"Message received")))
             }));
 
-            Ok(Response::builder()
+            let result = Response::builder()
                 .status(StatusCode::OK)
-                .body(BoxBody::new(stream_body))
-                .expect("Failed to construct Response"))
+                .body(BoxBody::new(stream_body));
+
+            match result {
+                Ok(response) => Ok(response),
+                Err(e) => Err(Error::HyperHttp(e)),
+            }
         })
     }
 }
@@ -140,17 +145,20 @@ impl hyper::service::Service<Request<Incoming>> for ServiceHandlerWrapper {
         let handler = self.inner.clone();
         Box::pin(async move {
             match req.method() {
-                &hyper::Method::GET => handler.handle_get().await,
+                &hyper::Method::GET => handler.handle_get(req).await,
                 &hyper::Method::POST => handler.handle_post(req).await,
                 _ => {
                     let stream = futures::stream::once(async {
                         Ok(Frame::data(Bytes::from_static(b"Method not allowed")))
                     });
                     let body = BoxBody::new(StreamBody::new(stream));
-                    Ok(Response::builder()
+                    let result = Response::builder()
                         .status(StatusCode::METHOD_NOT_ALLOWED)
-                        .body(body)
-                        .expect("Failed to construct Response"))
+                        .body(body);
+                    match result {
+                        Ok(response) => Ok(response),
+                        Err(e) => Err(Error::HyperHttp(e)),
+                    }
                 }
             }
         })
