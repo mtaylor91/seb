@@ -1,12 +1,15 @@
 use http_body_util::{BodyExt, combinators::BoxBody, StreamBody};
 use hyper::{body::{Bytes, Frame, Incoming}, Request, Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo};
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::vec::IntoIter;
 use tokio::signal::unix::{signal, SignalKind};
-use tokio::sync::broadcast;
-use tokio_stream::{StreamExt, wrappers::{BroadcastStream, errors::BroadcastStreamRecvError}};
+use tokio::sync::broadcast::{self, error::SendError};
+use tokio_stream::{Iter, StreamExt};
+use tokio_stream::wrappers::{BroadcastStream, errors::BroadcastStreamRecvError};
 
 pub enum Error {
     HyperHttp(hyper::http::Error),
@@ -33,51 +36,101 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+
+pub struct Mailbox {
+    messages: Vec<Bytes>,
+    tx: broadcast::Sender<Bytes>,
+}
+
+impl Mailbox {
+    pub fn new() -> Self {
+        let (tx, _rx) = broadcast::channel(10);
+        Mailbox { messages: Vec::new(), tx }
+    }
+
+    pub fn send(&mut self, data: Bytes) -> Result<usize, SendError<Bytes>> {
+        self.messages.push(data.clone());
+        self.tx.send(data)
+    }
+
+    pub fn replay(&self) -> Iter<IntoIter<Bytes>> {
+        tokio_stream::iter(self.messages.clone())
+    }
+
+    pub fn stream(&self) -> BroadcastStream<Bytes> {
+        BroadcastStream::new(self.tx.subscribe())
+    }
+}
+
+
 type ServiceResponse = Response<BoxBody<Bytes, Error>>;
 type ServiceResult = Result<ServiceResponse, Error>;
 type ServiceResultFuture<'a> = Pin<Box<dyn Future<Output = ServiceResult> + Send + 'a>>;
 
+
 pub struct ServiceHandler {
-    events: Arc<Mutex<Vec<Bytes>>>,
-    tx: broadcast::Sender<Bytes>,
+    mailboxes: Arc<Mutex<HashMap<String, Mailbox>>>,
 }
 
 impl Clone for ServiceHandler {
     fn clone(&self) -> Self {
         ServiceHandler {
-            events: self.events.clone(),
-            tx: self.tx.clone(),
+            mailboxes: self.mailboxes.clone(),
         }
     }
 }
 
 impl ServiceHandler {
-    fn handle_get(&self, _req: Request<Incoming>) -> ServiceResultFuture {
-        let events: Vec<Bytes> = self.events.lock().unwrap().clone();
-        let tx: broadcast::Sender<Bytes> = self.tx.clone();
-        Box::pin(async move {
-            let replay_stream = tokio_stream::iter(events)
-                .map(|x| Ok(Frame::data(x)));
-            let tx_stream = BroadcastStream::new(tx.subscribe())
-                .map(|x| match x {
-                    Ok(data) => Ok(Frame::data(data)),
-                    Err(BroadcastStreamRecvError::Lagged(n)) =>
-                        Err(Error::TooFarBehind(n)),
+    fn handle_get(&self, req: Request<Incoming>) -> ServiceResultFuture {
+        let path = req.uri().path().to_string();
+        let mailboxes = self.mailboxes.lock().unwrap();
+
+        match mailboxes.get(&path) {
+            Some(mailbox) => {
+                let replay_stream = mailbox.replay()
+                    .map(|x| Ok(Frame::data(x)));
+                let tx_stream = mailbox.stream()
+                    .map(|x| match x {
+                        Ok(data) => Ok(Frame::data(data)),
+                        Err(BroadcastStreamRecvError::Lagged(n)) =>
+                            Err(Error::TooFarBehind(n)),
+                    });
+                let stream = replay_stream.chain(tx_stream).take(10);
+                let body = BoxBody::new(StreamBody::new(stream));
+                let result = Response::builder()
+                    .status(StatusCode::OK)
+                    .body(body);
+                match result {
+                    Ok(response) => Box::pin(async { Ok(response) }),
+                    Err(e) => Box::pin(async { Err(Error::HyperHttp(e)) }),
+                }
+            },
+            None => {
+                let stream = futures::stream::once(async {
+                    Ok(Frame::data(Bytes::from_static(b"Mailbox not found")))
                 });
-            let stream = replay_stream.chain(tx_stream).take(10);
-            let body = BoxBody::new(StreamBody::new(stream));
-            let result = Response::builder()
-                .status(StatusCode::OK)
-                .body(body);
-            match result {
-                Ok(response) => Ok(response),
-                Err(e) => Err(Error::HyperHttp(e)),
+                let body = BoxBody::new(StreamBody::new(stream));
+                let result = Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .body(body);
+                match result {
+                    Ok(response) => Box::pin(async { Ok(response) }),
+                    Err(e) => Box::pin(async { Err(Error::HyperHttp(e)) }),
+                }
             }
-        })
+        }
     }
 
     fn handle_post(&self, req: Request<Incoming>) -> ServiceResultFuture {
-        let tx = self.tx.clone();
+        let path = req.uri().path().to_string();
+
+        {
+            let mut mailboxes = self.mailboxes.lock().unwrap();
+            if !mailboxes.contains_key(&path) {
+                mailboxes.insert(path.clone(), Mailbox::new());
+            }
+        }
+
         Box::pin(async move {
             let mut incoming = req.into_body();
 
@@ -86,11 +139,10 @@ impl ServiceHandler {
                 match frame {
                     Some(Ok(chunk)) => {
                         if let Some(data) = chunk.data_ref() {
-                            // Store the message
-                            self.events.lock().unwrap().push(data.clone());
-
-                            // Broadcast the message
-                            if tx.send(data.clone()).is_err() {
+                            // Send the message
+                            let mut mailboxes = self.mailboxes.lock().unwrap();
+                            let mailbox = mailboxes.get_mut(&path).unwrap();
+                            if mailbox.send(data.clone()).is_err() {
                                 eprintln!("Failed to broadcast message");
                                 break;
                             }
@@ -190,10 +242,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let executor = TokioExecutor::default();
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     let http = hyper_util::server::conn::auto::Builder::new(executor);
-    let events = Arc::new(Mutex::new(Vec::new()));
-    let (tx, _rx) = broadcast::channel(10);
+    let mailboxes = Arc::new(Mutex::new(HashMap::new()));
     let service = ServiceHandlerWrapper {
-        inner: ServiceHandler { events, tx }
+        inner: ServiceHandler { mailboxes }
     };
 
     let graceful = hyper_util::server::graceful::GracefulShutdown::new();
